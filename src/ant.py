@@ -21,6 +21,28 @@ class Ant:
         # Dynamic capacity to prevent exponential cost explosion on high beta
         self.capacity = self.gm.global_capacity
 
+    def _select_target(self, candidates, heuristic_values, pheromones):
+        """Min-max normalize the heuristic values and pick a target via roulette-wheel selection."""
+        eta_raw = [heuristic_values[c] for c in candidates]
+        eta_min, eta_max = min(eta_raw), max(eta_raw)
+        eta_range = eta_max - eta_min
+        eta_norm = {
+            c: (0.1 + 0.9 * (heuristic_values[c] - eta_min) / eta_range) if eta_range > 1e-9 else 1.0
+            for c in candidates
+        }
+
+        probabilities = [
+            # tau^alpha * eta^beta
+            (pheromones.get((self.current_node, c), 1.0) ** self.aco_alpha) * (eta_norm[c] ** self.aco_beta)
+            for c in candidates
+        ]
+        prob_sum = sum(probabilities)
+        if prob_sum == 0:
+            return random.choice(candidates)
+        norm_probs = [p / prob_sum for p in probabilities]
+        return random.choices(candidates, weights=norm_probs, k=1)[0]
+
+
     def step(self, pheromones):
         """Perform a single step of the ant's movement"""
         # 1. Check available capacity and decide whether to return to base
@@ -43,8 +65,8 @@ class Ant:
         candidates = []
         heuristic_values = {}
 
-        # Cost to return immediately to base
-        cost_return_now = 0.0
+        # Cost to return immediately to base (only meaningful when not already there)
+        path_u_0, cost_return_now = None, 0.0
         if self.current_node != 0:
             path_u_0, _ = self.gm.get_shortest_path(self.current_node, 0)
             cost_return_now = self.gm.calculate_path_cost(path_u_0, self.current_load)
@@ -53,97 +75,71 @@ class Ant:
 
         # Evaluate each neighbor for potential visit
         for v in neighbors:
-            if v in self.unvisited:
-                gold_to_take = min(self.local_gold[v], available_capacity)
+            if v not in self.unvisited:
+                continue
+            gold_to_take = min(self.local_gold[v], available_capacity)
 
-                # If at base, evaluate direct trip to v, with the classic heuristic of gold/distance
-                if self.current_node == 0:
-                    path_0_v, _ = self.gm.get_shortest_path(0, v)
-                    dist_0_v = self.gm.calculate_path_cost(path_0_v, 0)
-                    heuristic_values[v] = gold_to_take / (dist_0_v + 1e-6)
+            # If at base, evaluate direct trip to v, with the classic heuristic of gold/distance
+            if self.current_node == 0:
+                _, dist_0_v = self.gm.get_shortest_path(0, v)
+                heuristic_values[v] = gold_to_take / (dist_0_v + 1e-6)
+                candidates.append(v)
+            else:
+                # Evaluate if chaining the trip is cheaper than splitting it via base
+                path_u_v, _ = self.gm.get_shortest_path(self.current_node, v)
+                path_v_0, _ = self.gm.get_shortest_path(v, 0)
+                _, dist_0_v = self.gm.get_shortest_path(0, v)
+
+                # Cost of chaining: current -> v -> base
+                cost_chain = self.gm.calculate_path_cost(path_u_v, self.current_load) + \
+                             self.gm.calculate_path_cost(path_v_0, self.current_load + gold_to_take)
+
+                # Cost of splitting: current -> base, then base -> v -> base   
+                cost_split = cost_return_now + dist_0_v + \
+                             self.gm.calculate_path_cost(path_v_0, gold_to_take)
+
+                savings = cost_split - cost_chain
+                # Savings > 0 means visiting 'v' now is cheaper than an extra dedicated trip from base
+                if savings > 0:
+                    heuristic_values[v] = savings
                     candidates.append(v)
-                else:
-                    # Evaluate if chaining the trip is cheaper than splitting it via base
-                    path_u_v, _ = self.gm.get_shortest_path(self.current_node, v)
-                    path_v_0, _ = self.gm.get_shortest_path(v, 0)
-                    path_0_v, _ = self.gm.get_shortest_path(0, v)
 
-                    # Cost of chaining: current -> v -> base
-                    cost_chain = self.gm.calculate_path_cost(path_u_v, self.current_load) + \
-                                 self.gm.calculate_path_cost(path_v_0, self.current_load + gold_to_take)
-
-                    # Cost of splitting: current -> base, then base -> v -> base         
-                    cost_split = cost_return_now + \
-                                 self.gm.calculate_path_cost(path_0_v, 0) + \
-                                 self.gm.calculate_path_cost(path_v_0, gold_to_take)
-                    
-                    savings = cost_split - cost_chain
-                    
-                    # Savings > 0 means visiting 'v' now is cheaper than an extra dedicated trip from base
-                    if savings > 0: 
-                        heuristic_values[v] = savings
-                        candidates.append(v)
-
-        # 3. Limit cases handling                 
-        # If no candidates are available, consider returning to base
-        if self.current_node != 0 and not candidates:
-            chosen_target = 0
-        else:
-            # If ant is in base and no candidates are available, consider a few unvisited nodes to avoid deadlock
-            if not candidates and self.unvisited:
+        # 3. Target choice: base and non-base cases 
+        if self.current_node == 0:
+            # Consider a few unvisited nodes to avoid deadlock
+            if not candidates:  
                 for v in list(self.unvisited)[:5]:
                     candidates.append(v)
-                    path_0_v, _ = self.gm.get_shortest_path(0, v)
-                    dist_0_v = self.gm.calculate_path_cost(path_0_v, 0)
+                    _, dist_0_v = self.gm.get_shortest_path(0, v)
                     heuristic_values[v] = min(self.local_gold[v], available_capacity) / (dist_0_v + 1e-6)
-
-            # Return to base is always a candidate
-            if self.current_node != 0:
+            chosen_target = self._select_target(candidates, heuristic_values, pheromones)
+        else:
+            if not candidates:
+                chosen_target = 0
+            else:
+                # Return to base is always a candidate
                 candidates.append(0)
                 # Heuristic for returning to base is based on the current load and the cost to return
                 beta_p, alpha_p = self.gm.beta, self.gm.alpha
                 if self.current_load > 0 and beta_p > 1:
-                    # Higher current_load increases the urgency to return to base and unload
+                    # Higher current_load increases the urgency to return to base and unloa
                     marginal_rate = beta_p * alpha_p * self.current_load * (alpha_p * self.current_load) ** (beta_p - 1)
                 else:
                     marginal_rate = 0.0
                 heuristic_values[0] = max(marginal_rate, 1e-6)
+                chosen_target = self._select_target(candidates, heuristic_values, pheromones)
 
-            # Min-Max normalization of heuristic values for probabilistic selection, eta between 0.1 and 1.0 to keep some exploration
-            eta_raw = [heuristic_values[c] for c in candidates]
-            eta_min, eta_max = min(eta_raw), max(eta_raw)
-            eta_range = eta_max - eta_min
-            eta_norm = {}
-            for c in candidates:
-                if eta_range > 1e-9:
-                    eta_norm[c] = 0.1 + 0.9 * (heuristic_values[c] - eta_min) / eta_range
-                else:
-                    eta_norm[c] = 1.0
+        # 4. Move execution
+        if chosen_target == 0:
+            path, edge_cost = path_u_0, cost_return_now
+        else:
+            path, _ = self.gm.get_shortest_path(self.current_node, chosen_target)
+            edge_cost = self.gm.calculate_path_cost(path, self.current_load)
+        self.total_cost += edge_cost
 
-            # 4. Roulette wheel selection
-            probabilities = []
-            for target in candidates:
-                # Default pheromone level is 1.0 if not yet deposited
-                tau = pheromones.get((self.current_node, target), 1.0)
-                eta = eta_norm[target]
-
-                probabilities.append((tau ** self.aco_alpha) * (eta ** self.aco_beta))
-                
-            prob_sum = sum(probabilities)
-            # Fallback to uniform choice if numerical underflow occurs
-            if prob_sum == 0:
-                chosen_target = random.choice(candidates)
-            else:
-                norm_probs = [p / prob_sum for p in probabilities]
-                chosen_target = random.choices(candidates, weights=norm_probs, k=1)[0]
-                
-        # 5. Move execution
-        path, _ = self.gm.get_shortest_path(self.current_node, chosen_target)
-        self.total_cost += self.gm.calculate_path_cost(path, self.current_load)
-        
         for node in path[1:-1]:
             self.tour.append((node, 0))
-            
+
         if chosen_target == 0:
             self.tour.append((0, 0))
             self.current_load = 0.0
@@ -157,10 +153,10 @@ class Ant:
             self.local_gold[chosen_target] -= gold_collected
             if self.local_gold[chosen_target] < 1e-4:
                 self.unvisited.remove(chosen_target)
-                
+
         self.current_node = chosen_target
         self.decision_path.append(chosen_target)
-
+        
     def run_tour(self, pheromones):
         """Execute a complete tour until all nodes are visited"""
         while self.unvisited:
@@ -213,9 +209,6 @@ class TTP_ACO:
                 ant.run_tour(self.pheromones)
 
             ranked = sorted(ants, key=lambda a: a.total_cost)
-            # Print all ant costs for debugging purposes
-            for idx, ant in enumerate(ranked):
-                print(f"Ant {idx}: Cost = {ant.total_cost}")
             iteration_best_ant = ranked[0]
 
             if iteration_best_ant.total_cost < self.best_cost:
